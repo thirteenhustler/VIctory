@@ -50,10 +50,12 @@
 //!   descriptors (1,024 world compute programs, ray-tracing material
 //!   resolves) read raw views this way.
 //!
-//! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
-//!   atomically is declared a 32-bit unsigned single-channel view; the
-//!   host's view at that index must be an R32 integer view (64-bit atomics
-//!   stop the translation). Global loads from a root SRV read it raw.
+//! * **Texture atomics** (added 2026-11-23, 64-bit on 2026-11-24): a texture
+//!   UAV the shader uses atomically is declared a single-channel integer
+//!   view, 32-bit or 64-bit as the instruction's data width says. The host's
+//!   view at that index must match (an R32 integer view, or an R32G32 view
+//!   the shader reads as one 64-bit element). A 64-bit atomic needs a device
+//!   with 64-bit typed atomics. Global loads from a root SRV read it raw.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
