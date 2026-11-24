@@ -154,7 +154,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -321,6 +321,37 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
 
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
+}
+
+/// `ResourceProperties` word 1 of an integer image atomic this translator
+/// lowers: one U32 component, or one U64 when the data is two dwords.
+/// `None` for any other image operation (those stay four floats).
+fn image_atomic_props(name: &str, dmask: u8, d16: bool) -> Option<u32> {
+    let op = name.strip_prefix("image_atomic_")?;
+    if d16
+        || !matches!(
+            op,
+            "add"
+                | "sub"
+                | "and"
+                | "or"
+                | "xor"
+                | "smin"
+                | "smax"
+                | "umin"
+                | "umax"
+                | "swap"
+                | "cmpswap"
+        )
+    {
+        return None;
+    }
+    let wide = match (op == "cmpswap", dmask) {
+        (false, 1) | (true, 3) => false,
+        (false, 3) | (true, 0xF) => true,
+        _ => return None,
+    };
+    Some(if wide { 0x107 } else { 0x105 })
 }
 
 impl<'a> Lower<'a> {
@@ -2882,7 +2913,9 @@ impl<'a> Lower<'a> {
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
+            Fields::Image {
+                dim, dmask, d16, ..
+            } => {
                 let kind = match dim {
                     0 => 1,
                     1 => 2,
@@ -2891,7 +2924,13 @@ impl<'a> Lower<'a> {
                     5 => 7,
                     _ => return Err("an image dimension (cube or MSAA)"),
                 };
-                ((kind | u, 0x409), Some(kind))
+                // An atomic's descriptor is the integer view the atomic uses,
+                // so the two handles are one. A zero mask reads as the first
+                // channel, as the atomic itself does. Other images stay four
+                // floats.
+                let mask = if *dmask == 0 { 1 } else { *dmask };
+                let props1 = image_atomic_props(un, mask, *d16).unwrap_or(0x409);
+                ((kind | u, props1), Some(kind))
             }
             Fields::Buffer { idxen, format, .. } => {
                 let stride = used.map_or(0, |u| u.stride);
@@ -3211,7 +3250,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props.0, props.1);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -4048,6 +4087,18 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// Two dwords as an i64, low half first.
+    fn pack64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The low and high dwords of an i64.
@@ -5297,8 +5348,10 @@ impl<'a> Lower<'a> {
                 .is_some_and(|u| u.kind == ResourceType::Uav);
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
-            // DXIL's atomic operations on a 32-bit integer texture UAV; the
-            // old value returns with glc. Sub is the add of the negation.
+            // DXIL's atomic operations on an integer texture UAV; the old
+            // value returns with glc. Sub is the add of the negation.
+            // 32-bit data is one U32 component (an R32 view). 64-bit data is
+            // two dwords, one U64 component (an R32G32_UINT view on the host).
             let code = match op {
                 "add" | "sub" => 0,
                 "and" => 1,
@@ -5318,12 +5371,17 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            // dmask counts the data dwords (cmpswap: twice the value's).
+            let compare = code == u32::MAX;
+            let Some(props1) = image_atomic_props(name, *dmask, false) else {
+                return Err("an image atomic of another width");
+            };
+            let wide = props1 == 0x107;
+            let words = match (compare, wide) {
+                (false, false) => 1,
+                (true, true) => 4,
+                _ => 2,
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5332,29 +5390,65 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
-            let mut value = vals[0];
+            let vals = self.vgprs(inst, data, words)?;
+            let mut value = if wide {
+                self.pack64(vals[0], vals[1])
+            } else {
+                vals[0]
+            };
             if op == "sub" {
-                let z = self.s.m.i32(0);
+                let z = if wide {
+                    let i64t = self.s.m.int(64);
+                    self.s.m.int_const(i64t, 0)
+                } else {
+                    self.s.m.i32(0)
+                };
                 value = self.s.m.bin(c, Bin::Sub, z, value);
             }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
+            let old = if !wide {
+                match inst.read(Reg::V(reg)) {
+                    Some(v) if cache.glc => self.i32_of(v)?,
+                    _ => self.s.m.i32(0),
+                }
+            } else if cache.glc {
+                let lo = match inst.read(Reg::V(reg)) {
+                    Some(v) => self.i32_of(v)?,
+                    None => self.s.m.i32(0),
+                };
+                let hi = match inst.read(Reg::V(reg + 1)) {
+                    Some(v) => self.i32_of(v)?,
+                    None => self.s.m.i32(0),
+                };
+                self.pack64(lo, hi)
+            } else {
+                let i64t = self.s.m.int(64);
+                self.s.m.int_const(i64t, 0)
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            if wide {
+                self.s.flags |= flags::INT64 | flags::ATOMIC64_TYPED | flags::ATOMIC64_HEAP;
+            }
+            let h = self.handle(site, src, false, (kind | 0x1000, props1))?;
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
+            let ret = if wide { self.s.m.int(64) } else { self.s.t.i32 };
             let mut args = vec![h];
-            let r = if code == u32::MAX {
-                // cmpswap: data is (new, compare).
+            let r = if compare {
+                // cmpswap: data is (new, compare), each one or two dwords.
+                let compared = if wide {
+                    self.pack64(vals[2], vals[3])
+                } else {
+                    vals[1]
+                };
                 args.extend(cs);
-                args.extend([vals[1], vals[0]]);
+                args.extend([compared, value]);
                 self.s.op(
                     self.cur,
-                    "atomicCompareExchange.i32",
+                    if wide {
+                        "atomicCompareExchange.i64"
+                    } else {
+                        "atomicCompareExchange.i32"
+                    },
                     Attr::NoUnwind,
-                    i32t,
+                    ret,
                     79,
                     &args,
                 )
@@ -5362,12 +5456,28 @@ impl<'a> Lower<'a> {
                 args.push(self.s.m.i32(code));
                 args.extend(cs);
                 args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                self.s.op(
+                    self.cur,
+                    if wide {
+                        "atomicBinOp.i64"
+                    } else {
+                        "atomicBinOp.i32"
+                    },
+                    Attr::NoUnwind,
+                    ret,
+                    78,
+                    &args,
+                )
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                if wide {
+                    let (lo, hi) = self.split64(r);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.write(inst, Reg::V(reg), r, None);
+                }
             }
             return Ok(());
         }
@@ -6560,7 +6670,8 @@ impl<'a> Lower<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use crate::dxbc::{Container, FourCC};
+    use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -6649,5 +6760,420 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    /// `s_mov_b32 s1, 0` then an image descriptor from the resource heap.
+    const HEAP: [u32; 3] = [
+        0xBE81_0380, // s_mov_b32 s1, 0
+        0xF40C_0100,
+        0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+    ];
+    /// `v_mov_b32` of an inline integer.
+    const fn v_mov(dst: u32, imm: u32) -> u32 {
+        0x7E00_0000 | (dst << 17) | (1 << 9) | (128 + imm)
+    }
+
+    /// A 1D image atomic: opcode, dmask, glc, data starting at v2, resource s[4:11].
+    const fn image_atomic(opcode: u32, dmask: u32, glc: bool) -> [u32; 2] {
+        let glc = if glc { 1u32 << 13 } else { 0 };
+        [
+            0xF000_0000 | (opcode << 18) | (dmask << 8) | glc,
+            0x0001_0200,
+        ]
+    }
+
+    fn image_words(opcode: u32, dmask: u32, glc: bool, data: &[u32]) -> Vec<u32> {
+        let mut words = HEAP.to_vec();
+        words.extend(data);
+        words.extend(image_atomic(opcode, dmask, glc));
+        words
+    }
+
+    /// Lowers a compute program whose descriptor comes from the resource heap.
+    fn translate_image(words: &[u32]) -> Result<Vec<u8>, crate::ShaderError> {
+        let code: Vec<u8> = words
+            .iter()
+            .chain(std::iter::once(&S_ENDPGM))
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::ResourceHeap,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .map(|l| l.dxil)
+    }
+
+    fn image_text(words: &[u32]) -> String {
+        let code: Vec<u8> = words
+            .iter()
+            .chain(std::iter::once(&S_ENDPGM))
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        crate::gfx10::decode(&code)
+            .unwrap()
+            .iter()
+            .map(|i| i.text(false))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Names, integer constants and integer binops of an emitted container.
+    struct DxilFacts {
+        names: Vec<String>,
+        i32s: Vec<i64>,
+        i64s: Vec<i64>,
+        /// `Bin` discriminants of integer arithmetic in the function body.
+        bins: Vec<u64>,
+        sfi0: u64,
+    }
+
+    fn dxil_facts(container: &[u8]) -> DxilFacts {
+        let c = Container::parse(container).unwrap();
+        let sfi0 = u64::from_le_bytes(c.part(FourCC::SFI0).unwrap().data.try_into().unwrap());
+        let dxil = c.part(FourCC::DXIL).unwrap().data;
+        assert_eq!(&dxil[24..28], b"BC\xC0\xDE");
+        let mut bits = Bits {
+            data: &dxil[24..],
+            bit: 32,
+        };
+        let enter = bits.pull(2).unwrap();
+        assert_eq!(enter, 1, "module block");
+        assert_eq!(bits.vbr(8).unwrap(), 8);
+        let width = bits.vbr(4).unwrap() as u32;
+        let _len = bits.word().unwrap();
+        let mut facts = DxilFacts {
+            names: Vec::new(),
+            i32s: Vec::new(),
+            i64s: Vec::new(),
+            bins: Vec::new(),
+            sfi0,
+        };
+        let mut ints = Vec::new();
+        walk(&mut bits, width, Block::Other, &mut facts, &mut ints);
+        facts
+    }
+
+    /// Which bitcode block a record belongs to. Type ids are assigned in the
+    /// order the type block defines them, and the constants block (a sibling)
+    /// refers to those ids.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Block {
+        Types,
+        Constants,
+        Symtab,
+        Function,
+        Other,
+    }
+
+    fn walk(
+        bits: &mut Bits<'_>,
+        width: u32,
+        kind: Block,
+        facts: &mut DxilFacts,
+        ints: &mut Vec<u32>,
+    ) {
+        let mut const_ty = None;
+        loop {
+            let code = bits.pull(width).expect("block code");
+            match code {
+                0 => {
+                    bits.align32();
+                    return;
+                }
+                1 => {
+                    let id = bits.vbr(8).unwrap();
+                    let new_w = bits.vbr(4).unwrap() as u32;
+                    let _len = bits.word().unwrap();
+                    let child = match id {
+                        17 => Block::Types,
+                        11 => Block::Constants,
+                        14 => Block::Symtab,
+                        12 => Block::Function,
+                        _ => Block::Other,
+                    };
+                    walk(bits, new_w, child, facts, ints);
+                }
+                3 => {
+                    let rec = bits.vbr(6).unwrap();
+                    let n = bits.vbr(6).unwrap() as usize;
+                    let mut ops = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        ops.push(bits.vbr(6).unwrap());
+                    }
+                    match kind {
+                        Block::Types => match rec {
+                            // A named struct's name, then its body (code 20).
+                            19 => {}
+                            7 if n == 1 => ints.push(ops[0] as u32),
+                            // void, float, pointer, array, struct, function.
+                            2 | 3 | 8 | 11 | 18 | 20 | 21 => ints.push(0),
+                            _ => {}
+                        },
+                        Block::Constants => match rec {
+                            1 if n == 1 => const_ty = Some(ops[0] as u32),
+                            4 if n == 1 => {
+                                let v = unsign(ops[0]);
+                                match const_ty.and_then(|t| ints.get(t as usize).copied()) {
+                                    Some(32) => facts.i32s.push(v),
+                                    Some(64) => facts.i64s.push(v),
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        },
+                        Block::Symtab if rec == 1 && n > 1 => {
+                            if let Ok(s) =
+                                String::from_utf8(ops[1..].iter().map(|&b| b as u8).collect())
+                                && (s.starts_with("dx.op.") || s == "main")
+                            {
+                                facts.names.push(s);
+                            }
+                        }
+                        // binop: [lhs, rhs, opcode].
+                        Block::Function if rec == 2 && n == 3 => facts.bins.push(ops[2]),
+                        _ => {}
+                    }
+                }
+                other => panic!("abbreviation {other} at bit {}", bits.bit),
+            }
+        }
+    }
+
+    fn unsign(v: u64) -> i64 {
+        if v & 1 == 0 {
+            (v >> 1) as i64
+        } else {
+            -((v >> 1) as i64)
+        }
+    }
+
+    struct Bits<'a> {
+        data: &'a [u8],
+        bit: usize,
+    }
+
+    impl Bits<'_> {
+        fn pull(&mut self, width: u32) -> Option<u64> {
+            let width = width as usize;
+            if self.bit + width > self.data.len() * 8 {
+                return None;
+            }
+            let mut v = 0u64;
+            for i in 0..width {
+                let at = self.bit + i;
+                let bit = (self.data[at / 8] >> (at % 8)) & 1;
+                v |= u64::from(bit) << i;
+            }
+            self.bit += width;
+            Some(v)
+        }
+
+        fn vbr(&mut self, width: u32) -> Option<u64> {
+            let hi = 1u64 << (width - 1);
+            let mut v = 0u64;
+            let mut shift = 0u32;
+            loop {
+                let c = self.pull(width)?;
+                v |= (c & (hi - 1)) << shift;
+                if c & hi == 0 {
+                    return Some(v);
+                }
+                shift += width - 1;
+                if shift >= 64 {
+                    return None;
+                }
+            }
+        }
+
+        fn align32(&mut self) {
+            let rem = self.bit % 32;
+            if rem != 0 {
+                self.bit += 32 - rem;
+            }
+        }
+
+        fn word(&mut self) -> Option<u32> {
+            self.align32();
+            self.pull(32).map(|w| w as u32)
+        }
+    }
+
+    /// Shader flag bits the 64-bit path must declare, and the SFI0 word they map to.
+    const ATOMIC64_FLAGS: i64 = (1 << 20) | (1 << 27) | (1 << 30) | (1 << 32);
+    const ATOMIC64_SFI0: u64 = 0x8000 | 0x400_000 | 0x200_0000 | 0x1000_0000;
+
+    fn data_movs(n: u32) -> Vec<u32> {
+        (0..n).map(|k| v_mov(2 + k, k)).collect()
+    }
+
+    #[test]
+    fn a_64_bit_image_atomic_is_one_u64_on_an_r32g32_view() {
+        let words = image_words(0x011, 3, true, &data_movs(2));
+        assert_eq!(
+            image_text(&words),
+            "s_mov_b32 s1, 0; s_load_dwordx8 s[4:11], s[0:1], null; \
+             v_mov_b32 v2, 0; v_mov_b32 v3, 1; \
+             image_atomic_add v[2:3], v0, s[4:11] dmask:0x3 dim:SQ_RSRC_IMG_1D glc; s_endpgm"
+        );
+        let dxil = translate_image(&words).unwrap();
+        let facts = dxil_facts(&dxil);
+        assert!(
+            facts.names.iter().any(|n| n == "dx.op.atomicBinOp.i64"),
+            "{:?}",
+            facts.names
+        );
+        assert!(
+            !facts
+                .names
+                .iter()
+                .any(|n| n.ends_with(".i32") && n.contains("atomic"))
+        );
+        assert!(facts.i32s.contains(&0x107), "U64 props {:?}", facts.i32s);
+        assert!(!facts.i32s.contains(&0x105), "32-bit props leaked");
+        assert!(facts.i32s.contains(&0x1001), "1D UAV kind");
+        assert!(facts.i64s.contains(&ATOMIC64_FLAGS), "{:x?}", facts.i64s);
+        assert_eq!(facts.sfi0, ATOMIC64_SFI0, "{:#x}", facts.sfi0);
+    }
+
+    #[test]
+    fn image_atomic_sub_negates_the_64_bit_value() {
+        let subs = |opcode| {
+            let words = image_words(opcode, 3, true, &data_movs(2));
+            dxil_facts(&translate_image(&words).unwrap())
+                .bins
+                .iter()
+                .filter(|&&op| op == 1)
+                .count()
+        };
+        // The descriptor's size fields subtract one. Subtraction of the
+        // atomic value is the one extra.
+        assert_eq!(subs(0x012), subs(0x011) + 1);
+        let facts =
+            dxil_facts(&translate_image(&image_words(0x012, 3, true, &data_movs(2))).unwrap());
+        assert!(facts.names.iter().any(|n| n == "dx.op.atomicBinOp.i64"));
+        assert_eq!(facts.sfi0, ATOMIC64_SFI0);
+    }
+
+    #[test]
+    fn image_atomic_cmpswap_of_64_bits_exchanges_two_i64s() {
+        let words = image_words(0x010, 0xF, true, &data_movs(4));
+        assert!(
+            image_text(&words).contains(
+                "image_atomic_cmpswap v[2:5], v0, s[4:11] dmask:0xf dim:SQ_RSRC_IMG_1D glc"
+            ),
+            "{}",
+            image_text(&words)
+        );
+        let facts = dxil_facts(&translate_image(&words).unwrap());
+        assert!(
+            facts
+                .names
+                .iter()
+                .any(|n| n == "dx.op.atomicCompareExchange.i64")
+        );
+        assert!(!facts.names.iter().any(|n| n.contains("atomicBinOp")));
+        assert!(facts.i32s.contains(&0x107));
+        assert_eq!(facts.sfi0, ATOMIC64_SFI0);
+    }
+
+    #[test]
+    fn image_atomics_cover_every_64_bit_integer_op_and_a_2d_address() {
+        for opcode in [
+            0x00f, 0x011, 0x012, 0x014, 0x015, 0x016, 0x017, 0x018, 0x019, 0x01a,
+        ] {
+            translate_image(&image_words(opcode, 3, false, &data_movs(2))).unwrap();
+        }
+        // 2D: dimension is bits 3-5 of the image instruction's first word.
+        let mut words = image_words(0x011, 3, true, &data_movs(2));
+        let n = words.len();
+        words[n - 2] |= 1 << 3;
+        assert!(
+            image_text(&words).contains("dim:SQ_RSRC_IMG_2D"),
+            "{}",
+            image_text(&words)
+        );
+        let facts = dxil_facts(&translate_image(&words).unwrap());
+        assert!(facts.names.iter().any(|n| n == "dx.op.atomicBinOp.i64"));
+        assert!(facts.i32s.contains(&0x1002), "2D UAV kind {:?}", facts.i32s);
+    }
+
+    #[test]
+    fn a_32_bit_image_atomic_stays_one_u32() {
+        let words = image_words(0x011, 1, true, &[v_mov(2, 1)]);
+        assert!(
+            image_text(&words).contains("image_atomic_add v2, v0, s[4:11] dim:SQ_RSRC_IMG_1D glc"),
+            "{}",
+            image_text(&words)
+        );
+        let facts = dxil_facts(&translate_image(&words).unwrap());
+        assert!(facts.names.iter().any(|n| n == "dx.op.atomicBinOp.i32"));
+        assert!(!facts.names.iter().any(|n| n.contains(".i64")));
+        assert!(facts.i32s.contains(&0x105), "{:?}", facts.i32s);
+        assert!(!facts.i32s.contains(&0x107));
+        assert_eq!(facts.sfi0, 0x200_0000, "{:#x}", facts.sfi0);
+    }
+
+    #[test]
+    fn image_atomics_still_reject_widths_and_ops_they_cannot_do() {
+        let cases = [
+            (
+                image_words(0x011, 3, true, &data_movs(2)),
+                true,
+                "a 16-bit image atomic",
+            ),
+            (
+                image_words(0x011, 7, true, &data_movs(4)),
+                false,
+                "an image atomic of another width",
+            ),
+            (
+                image_words(0x01b, 1, true, &[v_mov(2, 1)]),
+                false,
+                "image_atomic_inc",
+            ),
+            (
+                image_words(0x01e, 1, true, &[v_mov(2, 1)]),
+                false,
+                "image_atomic_fmin",
+            ),
+        ];
+        for (mut words, d16, reason) in cases {
+            if d16 {
+                let n = words.len();
+                words[n - 1] |= 1 << 31;
+            }
+            let err = translate_image(&words).unwrap_err();
+            assert!(err.to_string().contains(reason), "{err} (wanted {reason})");
+        }
     }
 }
