@@ -128,6 +128,9 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     None
 }
 
+/// Block, descriptor load, first dword, sampler, and the two resource-property words.
+type HandleKey = (usize, Site, u8, bool, u32, u32);
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -154,7 +157,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<HandleKey, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -3211,7 +3214,9 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                // The component type is part of the key: a 32-bit atomic and a
+                // 64-bit atomic on the same descriptor are different views.
+                let key = (self.cur, *load, *first, sampler, props.0, props.1);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -4048,6 +4053,18 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// Two register dwords as an i64, low dword first.
+    fn pack64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The low and high dwords of an i64.
@@ -5297,8 +5314,15 @@ impl<'a> Lower<'a> {
                 .is_some_and(|u| u.kind == ResourceType::Uav);
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
-            // DXIL's atomic operations on a 32-bit integer texture UAV; the
-            // old value returns with glc. Sub is the add of the negation.
+            // DXIL's atomic operations on an integer texture UAV; the old
+            // value returns with glc. Sub is the add of the negation.
+            // dmask counts the data dwords: one per 32-bit value, two per
+            // 64-bit value, and cmpswap carries the new value then the
+            // compare value. A 64-bit value is a register pair, low dword
+            // first, so the 32-bit order (new, compare) widens in place.
+            // The view is one unsigned component (U32 `0x105`, U64 `0x107`):
+            // the host view must be that integer view, and a 64-bit one
+            // needs the device's 64-bit typed atomics.
             let code = match op {
                 "add" | "sub" => 0,
                 "and" => 1,
@@ -5318,12 +5342,12 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            let words = match (*dmask, code == u32::MAX) {
+                (1, false) | (3, true) => 1,
+                (3, false) | (0xF, true) => 2,
+                _ => return Err("an image atomic data width"),
+            };
+            let wide = words == 2;
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5332,42 +5356,82 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
-            let mut value = vals[0];
+            let vals = self.vgprs(inst, data, words * if code == u32::MAX { 2 } else { 1 })?;
+            let pack = |l: &mut Self, at: usize| {
+                if wide {
+                    l.pack64(vals[at], vals[at + 1])
+                } else {
+                    vals[at]
+                }
+            };
+            let mut value = pack(self, 0);
+            // Compare value, packed in this block so the guarded atomic can use it.
+            let compare = (code == u32::MAX).then(|| pack(self, words as usize));
             if op == "sub" {
-                let z = self.s.m.i32(0);
+                let z = if wide {
+                    let t = self.s.m.int(64);
+                    self.s.m.int_const(t, 0)
+                } else {
+                    self.s.m.i32(0)
+                };
                 value = self.s.m.bin(c, Bin::Sub, z, value);
             }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
+            let old = if cache.glc {
+                if wide {
+                    let lo = self.i32_of(inst.read(Reg::V(reg)).ok_or("image atomic data")?)?;
+                    let hi = self.i32_of(inst.read(Reg::V(reg + 1)).ok_or("image atomic data")?)?;
+                    self.pack64(lo, hi)
+                } else {
+                    match inst.read(Reg::V(reg)) {
+                        Some(v) => self.i32_of(v)?,
+                        _ => self.s.m.i32(0),
+                    }
+                }
+            } else if wide {
+                let t = self.s.m.int(64);
+                self.s.m.int_const(t, 0)
+            } else {
+                self.s.m.i32(0)
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            // One component: U32 is 5, U64 is 7, count in bits 8-15.
+            let comp = if wide { 0x107 } else { 0x105 };
+            if wide {
+                self.s.atomic_int64 = true;
+            }
+            let h = self.handle(site, src, false, (kind | 0x1000, comp))?;
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
+            let ret = if wide { self.s.m.int(64) } else { self.s.t.i32 };
             let mut args = vec![h];
-            let r = if code == u32::MAX {
+            let r = if let Some(compare) = compare {
                 // cmpswap: data is (new, compare).
                 args.extend(cs);
-                args.extend([vals[1], vals[0]]);
-                self.s.op(
-                    self.cur,
-                    "atomicCompareExchange.i32",
-                    Attr::NoUnwind,
-                    i32t,
-                    79,
-                    &args,
-                )
+                args.extend([compare, value]);
+                let op_name = if wide {
+                    "atomicCompareExchange.i64"
+                } else {
+                    "atomicCompareExchange.i32"
+                };
+                self.s.op(self.cur, op_name, Attr::NoUnwind, ret, 79, &args)
             } else {
                 args.push(self.s.m.i32(code));
                 args.extend(cs);
                 args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                let op_name = if wide {
+                    "atomicBinOp.i64"
+                } else {
+                    "atomicBinOp.i32"
+                };
+                self.s.op(self.cur, op_name, Attr::NoUnwind, ret, 78, &args)
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                if wide {
+                    let (lo, hi) = self.split64(r);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.write(inst, Reg::V(reg), r, None);
+                }
             }
             return Ok(());
         }
@@ -6560,7 +6624,7 @@ impl<'a> Lower<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -6649,5 +6713,320 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    /// 64-bit image atomics (two data dwords, four for compare-swap) become
+    /// DXIL i64 atomics on a one-component unsigned view. 32-bit ones stay
+    /// i32. Checked from the container, with no GPU and no title shaders.
+    #[test]
+    fn image_atomics_translate_at_32_and_64_bits() {
+        // (dim, dmask, op, glc, dx.op name, 64-bit)
+        let cases = [
+            (1u32, 1u32, "add", true, "dx.op.atomicBinOp.i32", false),
+            (
+                1,
+                3,
+                "cmpswap",
+                true,
+                "dx.op.atomicCompareExchange.i32",
+                false,
+            ),
+            (0, 3, "add", true, "dx.op.atomicBinOp.i64", true),
+            (1, 3, "add", false, "dx.op.atomicBinOp.i64", true),
+            (1, 3, "sub", true, "dx.op.atomicBinOp.i64", true),
+            (1, 3, "smin", true, "dx.op.atomicBinOp.i64", true),
+            (2, 3, "umax", true, "dx.op.atomicBinOp.i64", true),
+            (4, 3, "swap", true, "dx.op.atomicBinOp.i64", true),
+            (
+                5,
+                0xF,
+                "cmpswap",
+                true,
+                "dx.op.atomicCompareExchange.i64",
+                true,
+            ),
+            (
+                1,
+                0xF,
+                "cmpswap",
+                false,
+                "dx.op.atomicCompareExchange.i64",
+                true,
+            ),
+        ];
+        for (dim, dmask, op, glc, dxop, wide) in cases {
+            let lowered = translate_image_atomic(dim, dmask, op, glc, false)
+                .unwrap_or_else(|e| panic!("dim {dim} dmask {dmask:#x} {op} glc {glc}: {e}"));
+            let (names, ints) = scan_bitcode(&dxil_bitcode(&lowered.dxil));
+            assert!(
+                names.iter().any(|n| n == dxop),
+                "dim {dim} {op} dmask {dmask:#x} emitted {names:?}, wanted {dxop}"
+            );
+            let other = if wide { "i32" } else { "i64" };
+            assert!(
+                names
+                    .iter()
+                    .all(|n| !n.contains("atomic") || !n.ends_with(other)),
+                "dim {dim} {op} also emitted the other width: {names:?}"
+            );
+            let features = sfi0(&lowered.dxil);
+            let typed = 0x0040_0000;
+            let heap = 0x1000_0000;
+            if wide {
+                assert_eq!(features & (0x8000 | typed | heap), 0x8000 | typed | heap);
+                assert!(ints.contains(&0x107), "U64 view missing: {ints:?}");
+            } else {
+                assert_eq!(
+                    features & (typed | heap),
+                    0,
+                    "32-bit shader set {features:#x}"
+                );
+                assert!(ints.contains(&0x105), "U32 view missing: {ints:?}");
+                assert!(!ints.contains(&0x107), "32-bit shader annotated U64");
+            }
+        }
+        let refused = |dim, dmask, op, d16| match translate_image_atomic(dim, dmask, op, false, d16)
+        {
+            Err(e) => e,
+            Ok(_) => panic!("dim {dim} dmask {dmask:#x} {op} translated"),
+        };
+        let width = refused(1, 7, "add", false);
+        assert!(
+            width.to_string().contains("an image atomic data width"),
+            "{width}"
+        );
+        let half = refused(1, 3, "add", true);
+        assert!(half.to_string().contains("a 16-bit image atomic"), "{half}");
+        let inc = refused(1, 1, "inc", false);
+        assert!(inc.to_string().contains("image_atomic_inc"), "{inc}");
+        let cube = refused(3, 1, "add", false);
+        assert!(cube.to_string().contains("an image dimension"), "{cube}");
+    }
+
+    fn translate_image_atomic(
+        dim: u32,
+        dmask: u32,
+        op: &str,
+        glc: bool,
+        d16: bool,
+    ) -> Result<super::Lowered, crate::ShaderError> {
+        let opcode = match op {
+            "swap" => 0x00f,
+            "cmpswap" => 0x010,
+            "add" => 0x011,
+            "sub" => 0x012,
+            "smin" => 0x014,
+            "umin" => 0x015,
+            "smax" => 0x016,
+            "umax" => 0x017,
+            "and" => 0x018,
+            "or" => 0x019,
+            "xor" => 0x01a,
+            "inc" => 0x01b,
+            _ => panic!("opcode {op}"),
+        };
+        let mut w0 = (0x3Cu32 << 26) | ((opcode & 0x7F) << 18) | (dmask << 8) | (dim << 3);
+        if opcode & 0x80 != 0 {
+            w0 |= 1;
+        }
+        if glc {
+            w0 |= 1 << 13;
+        }
+        // v0 is the data, v8 the address, s[4:11] the descriptor.
+        let mut w1 = 8u32 | (1 << 16);
+        if d16 {
+            w1 |= 1 << 31;
+        }
+        let words = [
+            0xBE82_0300u32, // s_mov_b32 s2, s0
+            0xBE83_0380,    // s_mov_b32 s3, 0
+            0xF40C_0101,    // s_load_dwordx8 s[4:11], s[2:3], null
+            0xFA00_0000,
+            w0,
+            w1,
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let decoded = crate::gfx10::decode(&code).unwrap();
+        let image = decoded
+            .iter()
+            .find(|i| i.name().is_some_and(|n| n.starts_with("image_")));
+        let Some(image) = image else {
+            panic!("image opcode did not decode: {decoded:?}");
+        };
+        let want = format!("image_atomic_{op}");
+        assert_eq!(image.name(), Some(want.as_str()));
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            // Two user SGPRs, so s0 is the table and not a system value.
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+    }
+
+    fn sfi0(container: &[u8]) -> u64 {
+        let c = crate::dxbc::Container::parse(container).unwrap();
+        let data = c.part(crate::dxbc::FourCC::SFI0).unwrap().data;
+        u64::from_le_bytes(data[..8].try_into().unwrap())
+    }
+
+    fn dxil_bitcode(container: &[u8]) -> Vec<u8> {
+        let c = crate::dxbc::Container::parse(container).unwrap();
+        let part = c.part(crate::dxbc::FourCC::DXIL).unwrap().data;
+        crate::dxil::DxilProgram::parse(part)
+            .unwrap()
+            .bitcode
+            .to_vec()
+    }
+
+    /// Symbol names and integer constants of an unabbreviated LLVM 3.7 module.
+    fn scan_bitcode(bitcode: &[u8]) -> (Vec<String>, Vec<i64>) {
+        let mut words = Vec::with_capacity(bitcode.len() / 4);
+        for chunk in bitcode.chunks(4) {
+            words.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        let mut bits = Bits {
+            words: &words,
+            pos: 32,
+        };
+        let code = bits.take(2);
+        assert_eq!(code, 1, "bitcode does not open with a block");
+        let id = bits.vbr(8);
+        assert_eq!(id, 8, "bitcode block {id} is not the module");
+        let width = bits.vbr(4) as u32;
+        bits.align();
+        let len = bits.take(32) as usize;
+        let end = bits.pos + len * 32;
+        let mut names = Vec::new();
+        let mut ints = Vec::new();
+        walk(&mut bits, width, end, Block::Module, &mut names, &mut ints);
+        (names, ints)
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Block {
+        Module,
+        Constants,
+        Symbols,
+        Other,
+    }
+
+    struct Bits<'a> {
+        words: &'a [u32],
+        pos: usize,
+    }
+
+    impl Bits<'_> {
+        fn take(&mut self, width: u32) -> u64 {
+            let mut v = 0u64;
+            for i in 0..width {
+                let p = self.pos + i as usize;
+                let bit = u64::from((self.words[p / 32] >> (p % 32)) & 1);
+                v |= bit << i;
+            }
+            self.pos += width as usize;
+            v
+        }
+
+        fn vbr(&mut self, width: u32) -> u64 {
+            let hi = 1u64 << (width - 1);
+            let mut v = 0u64;
+            let mut shift = 0;
+            loop {
+                let c = self.take(width);
+                v |= (c & (hi - 1)) << shift;
+                if c & hi == 0 {
+                    return v;
+                }
+                shift += width - 1;
+            }
+        }
+
+        fn align(&mut self) {
+            let rem = self.pos % 32;
+            if rem != 0 {
+                self.pos += 32 - rem;
+            }
+        }
+    }
+
+    fn walk(
+        bits: &mut Bits<'_>,
+        width: u32,
+        end: usize,
+        block: Block,
+        names: &mut Vec<String>,
+        ints: &mut Vec<i64>,
+    ) {
+        while bits.pos < end {
+            let code = bits.take(width);
+            match code {
+                0 => {
+                    bits.align();
+                    return;
+                }
+                1 => {
+                    let id = bits.vbr(8);
+                    let inner = bits.vbr(4) as u32;
+                    bits.align();
+                    let len = bits.take(32) as usize;
+                    let body = bits.pos + len * 32;
+                    let kind = match id {
+                        11 => Block::Constants,
+                        14 => Block::Symbols,
+                        _ => Block::Other,
+                    };
+                    if kind == Block::Other {
+                        bits.pos = body;
+                    } else {
+                        walk(bits, inner, body, kind, names, ints);
+                    }
+                }
+                3 => {
+                    let rec = bits.vbr(6);
+                    let n = bits.vbr(6) as usize;
+                    let ops: Vec<u64> = (0..n).map(|_| bits.vbr(6)).collect();
+                    if block == Block::Symbols && rec == 1 && ops.len() > 1 {
+                        let name: String = ops[1..].iter().map(|c| char::from(*c as u8)).collect();
+                        names.push(name);
+                    }
+                    if block == Block::Constants && rec == 4 && !ops.is_empty() {
+                        let enc = ops[0];
+                        let mag = (enc >> 1) as i64;
+                        ints.push(if enc & 1 == 0 { mag } else { -mag });
+                    }
+                }
+                other => panic!("abbreviation {other} in a module written without them"),
+            }
+        }
     }
 }

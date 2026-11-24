@@ -65,6 +65,9 @@ pub(crate) struct Shader {
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
     pub flags: u64,
+    /// The shader does a 64-bit atomic on a typed resource through the
+    /// descriptor heap. Declared in `SFI0`, not in the shader-flag word.
+    pub atomic_int64: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -118,6 +121,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             flags: 0,
+            atomic_int64: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -563,6 +567,11 @@ impl Shader {
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= 0x400_0000;
+        }
+        if self.atomic_int64 {
+            // Typed-resource 64-bit atomics, and the same through the
+            // descriptor heap (image atomics are heap handles).
+            features |= 0x0040_0000 | 0x1000_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);
