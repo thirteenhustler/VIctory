@@ -61,7 +61,10 @@
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read).
+//! Merged stages (local, hull, export, geometry) keep their stage data in
+//! another layout, which is not read. An export shader is still translated,
+//! as a vertex shader: `exp paramN` is signature row N until that layout is
+//! known. Geometry, hull and local shaders are not.
 //!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
@@ -268,6 +271,12 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    /// An export shader (the vertex program compiled for a geometry shader).
+    /// `outputs` stays empty: the merged stage-data layout is not read, so
+    /// `exp paramN` is taken as signature row N.
+    Es {
+        outputs: Vec<VsOutput>,
+    },
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -529,6 +538,11 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+            // The merged layout is not read. An export shader still runs, as
+            // a vertex shader, with parameter N on signature row N.
+            HwStage::Es => StageIo::Es {
+                outputs: Vec::new(),
+            },
             _ => StageIo::None,
         };
         out.push(NativeProgram {

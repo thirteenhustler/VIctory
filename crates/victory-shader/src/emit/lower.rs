@@ -915,6 +915,12 @@ impl<'a> Lower<'a> {
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
+                    // An export shader's system VGPRs are not the vertex
+                    // shader's. Reading one as zero would draw the wrong
+                    // vertex; stop instead.
+                    None if self.x.native.stage == HwStage::Es => {
+                        Val::Missing("a merged-stage system VGPR")
+                    }
                     // Registers no one set read as zero (the validator
                     // refuses reads of undef).
                     None => Val::I32(self.s.m.i32(0)),
@@ -6439,6 +6445,10 @@ impl<'a> Lower<'a> {
                 }
                 Term::Ret
             }
+            // The handover to the geometry half (`s_setpc_b64` through a
+            // register). That half is a separate stage; this vertex shader
+            // ends here.
+            LaneExit::Indirect if self.x.native.stage == HwStage::Es => Term::Ret,
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
         let _ = Exit::End;

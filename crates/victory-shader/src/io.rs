@@ -255,6 +255,10 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             ];
             (loaded, &[][..], &ms.outputs[..])
         }
+        // Export shader: no fetch-shader attributes (the title loads
+        // vertices itself). Merged-stage system VGPRs are not the vertex
+        // shader's v0/v2/v3, so a read of one fails closed in the emitter.
+        (StageIo::Es { outputs }, HwStage::Es) => (Vec::new(), &[][..], outputs.as_slice()),
         _ => return Err(unsupported(0, "I/O of this stage")),
     };
     let inputs: Vec<(Value, Input)> = p
@@ -378,6 +382,14 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         9 => Target::Null,
                         t @ 12..=16 => Target::Position(t - 12),
                         20 => Target::Primitive,
+                        // Merged stage data is not read, so an export shader's
+                        // parameter N is the signature row of that number.
+                        t @ 32..=63 if native.stage == HwStage::Es && params.is_empty() => {
+                            Target::Param {
+                                usage: Usage::Generic,
+                                row: t - 32,
+                            }
+                        }
                         32 if params.is_empty() => Target::Unread,
                         t @ 32..=63 => {
                             // Bit 7: a mesh program's per-primitive output.
