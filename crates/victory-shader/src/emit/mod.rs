@@ -64,6 +64,13 @@
 //! * **Signatures** as the console container has them (same semantics,
 //!   registers and masks), so the input layout and stage linking are the
 //!   title's; pixel outputs are plain 32-bit values.
+//! * **Export shaders** ([`HwStage::Es`], emitted as `vs_6_6`). The vertex
+//!   program compiled to run with a geometry shader. Its merged stage data
+//!   is not read: `exp paramN` is signature row N, and a system VGPR read
+//!   before it is written stops the translation instead of becoming zero.
+//!   `s_setpc_b64` through a register ends the shader (the handover to the
+//!   geometry half). A container that also has a plain vertex program uses
+//!   that one. Geometry, hull and local programs are not translated.
 //! * **Mesh shaders** ([`HwStage::Ms`], `ms_6_6`): user data and
 //!   descriptors as above (the root constants visible to the mesh stage);
 //!   the pipeline is a mesh pipeline (pipeline-state stream, no input
@@ -183,24 +190,36 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// Translates the vertex, pixel, compute, mesh or export program of a
+/// console shader container. An export program is used only when the
+/// container has none of the others: a vertex program compiled both ways
+/// keeps the plain one.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
+    let programs = crate::native_programs(dxil.data)?;
+    let native = programs
+        .iter()
         .find(|p| {
             matches!(
                 p.stage,
                 HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
             )
         })
+        .or_else(|| programs.iter().find(|p| p.stage == HwStage::Es))
+        .cloned()
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: if programs
+                .iter()
+                .any(|p| matches!(p.stage, HwStage::Gs | HwStage::Hs | HwStage::Ls))
+            {
+                "a geometry, hull or local stage"
+            } else {
+                "a container without a vertex, pixel, compute, mesh or export program"
+            },
         })?;
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let res = resource::track(&p, &native.layout, native.stage)?;
@@ -593,5 +612,305 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    /// An export shader is the vertex program compiled for a geometry
+    /// shader. It becomes a vertex shader: parameter N is signature row N,
+    /// a handover to the geometry half ends it, and a system VGPR is not
+    /// read as zero. A plain vertex program wins when both are present.
+    /// Geometry, hull and local programs stay untranslated.
+    #[test]
+    fn an_export_shader_translates_as_a_vertex_shader() {
+        let moves = [
+            0x7E00_0280u32, // v_mov_b32 v0, 0
+            0x7E02_0280,    // v1
+            0x7E04_0280,    // v2
+            0x7E06_0280,    // v3
+        ];
+        let exports = [
+            0xF800_021Fu32, // exp param1, v0, v1, v2, v3
+            0x0302_0100,
+            0xF800_08CF, // exp pos0, v0, v1, v2, v3 done
+            0x0302_0100,
+        ];
+        let end = 0xBF81_0000u32; // s_endpgm
+        let handover = 0xBE80_2000u32; // s_setpc_b64 s[0:1]
+        let mut ended = moves.to_vec();
+        ended.extend(exports);
+        ended.push(end);
+        let mut handed = moves.to_vec();
+        handed.extend(exports);
+        handed.push(handover);
+
+        let host = translate_stage(Hw::Es, &ended, &[]);
+        assert_eq!(host.stage, crate::HwStage::Es);
+        let program = dxil_program(&host.dxil);
+        assert_eq!(program.kind, crate::dxil::ShaderKind::Vertex);
+        assert_eq!(program.shader_model, (6, 6));
+        let names = symbol_names(program.bitcode);
+        assert!(
+            names.iter().any(|n| n == "dx.op.storeOutput.f32"),
+            "exports did not become vertex outputs: {names:?}"
+        );
+
+        let handed = translate_stage(Hw::Es, &handed, &[]);
+        assert_eq!(handed.stage, crate::HwStage::Es);
+        assert!(
+            symbol_names(dxil_program(&handed.dxil).bitcode)
+                .iter()
+                .any(|n| n == "dx.op.storeOutput.f32")
+        );
+
+        // v0 is never written, so the position export reads a system VGPR.
+        let reads_system = [0xF800_08CFu32, 0x0302_0100, end];
+        let err = translate_stage_err(Hw::Es, &reads_system, &[]);
+        assert!(
+            err.to_string().contains("a merged-stage system VGPR"),
+            "{err}"
+        );
+
+        let err = translate_stage_err(Hw::Gs, &[end], &[]);
+        assert!(
+            err.to_string().contains("a geometry, hull or local stage"),
+            "{err}"
+        );
+        let err = translate_stage_err(Hw::Hs, &[end], &[]);
+        assert!(
+            err.to_string().contains("a geometry, hull or local stage"),
+            "{err}"
+        );
+        let err = translate_stage_err(Hw::Ls, &[end], &[]);
+        assert!(
+            err.to_string().contains("a geometry, hull or local stage"),
+            "{err}"
+        );
+
+        // Both variants: the plain vertex program is the one a pipeline
+        // without a geometry shader runs.
+        let both = translate_stage(Hw::Es, &ended, &[(Hw::Vs, &[end])]);
+        assert_eq!(both.stage, crate::HwStage::Vs);
+    }
+
+    /// Which hardware stage a synthetic container carries.
+    #[derive(Clone, Copy)]
+    enum Hw {
+        Es,
+        Gs,
+        Hs,
+        Ls,
+        Vs,
+    }
+
+    impl Hw {
+        fn slot(self) -> usize {
+            match self {
+                Hw::Ls => 0x08,
+                Hw::Hs => 0x10,
+                Hw::Es => 0x18,
+                Hw::Gs => 0x20,
+                Hw::Vs => 0x28,
+            }
+        }
+    }
+
+    fn translate_stage(stage: Hw, code: &[u32], also: &[(Hw, &[u32])]) -> super::HostShader {
+        match translate_stage_result(stage, code, also) {
+            Ok(s) => s,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    fn translate_stage_err(stage: Hw, code: &[u32], also: &[(Hw, &[u32])]) -> crate::ShaderError {
+        match translate_stage_result(stage, code, also) {
+            Err(e) => e,
+            Ok(_) => panic!("translation succeeded"),
+        }
+    }
+
+    fn translate_stage_result(
+        stage: Hw,
+        code: &[u32],
+        also: &[(Hw, &[u32])],
+    ) -> Result<super::HostShader, crate::ShaderError> {
+        let mut programs = vec![(stage, code)];
+        programs.extend(also.iter().map(|(s, c)| (*s, *c)));
+        let dxil = native_part(&programs);
+        let osg1 = signature_position_and_row1();
+        let bytes = crate::dxbc::build(&[
+            (crate::dxbc::FourCC::OSG1, &osg1),
+            (crate::dxbc::FourCC::DXIL, &dxil),
+        ]);
+        super::translate(&bytes)
+    }
+
+    /// `OSG1`: `SV_Position`, then a generic row 1 (what `exp param1` writes).
+    fn signature_position_and_row1() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(2u32.to_le_bytes());
+        out.extend(8u32.to_le_bytes());
+        let pos = 8 + 64;
+        let tex = pos + "SV_Position".len() as u32 + 1;
+        out.extend(sig_row(pos, 0, 1, 0));
+        out.extend(sig_row(tex, 0, 0, 1));
+        out.extend(b"SV_Position\0");
+        out.extend(b"TEXCOORD\0");
+        out
+    }
+
+    /// One signature row the parser accepts: stream 0, f32, mask `xyzw`.
+    fn sig_row(name_at: u32, index: u32, kind: u32, register: u32) -> [u8; 32] {
+        let mut row = [0u8; 32];
+        row[4..8].copy_from_slice(&name_at.to_le_bytes());
+        row[8..12].copy_from_slice(&index.to_le_bytes());
+        row[12..16].copy_from_slice(&kind.to_le_bytes());
+        row[16..20].copy_from_slice(&3u32.to_le_bytes());
+        row[20..24].copy_from_slice(&register.to_le_bytes());
+        row[24] = 0xF;
+        row
+    }
+
+    /// A `DXIL` part whose native blob holds `programs` (stage, machine code).
+    fn native_part(programs: &[(Hw, &[u32])]) -> Vec<u8> {
+        const ABSENT: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+        const RECORD: u64 = 0x54;
+        // Enough zero stage data for a vertex program's semantic tables.
+        const STAGE: u64 = 0x200;
+        let mut payload = 6u64.to_le_bytes().to_vec();
+        payload.resize(0x68, 0);
+        for at in [0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x48, 0x60] {
+            payload[at..at + 8].copy_from_slice(&ABSENT.to_le_bytes());
+        }
+        for &(stage, words) in programs {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let record = payload.len() as u64;
+            let code_at = record + RECORD + STAGE;
+            payload[stage.slot()..stage.slot() + 8].copy_from_slice(&record.to_le_bytes());
+            payload.resize(code_at as usize, 0);
+            let at = record as usize;
+            payload[at..at + 8].copy_from_slice(&code_at.to_le_bytes());
+            payload[at + 8..at + 16].copy_from_slice(&(code.len() as u64).to_le_bytes());
+            // 16 VGPRs, 8 SGPRs.
+            payload[at + 0x50..at + 0x54].copy_from_slice(&(16u32 | 8 << 20).to_le_bytes());
+            payload.extend_from_slice(&code);
+        }
+        let mut fssm = b"FSSM".to_vec();
+        fssm.extend_from_slice(&0x101u32.to_le_bytes());
+        fssm.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        fssm.extend_from_slice(&payload);
+        let stream = miniz_oxide::deflate::compress_to_vec_zlib(&fssm, 6);
+        let mut xbch = b"XBCH".to_vec();
+        xbch.extend_from_slice(&3u32.to_le_bytes());
+        xbch.extend_from_slice(&(stream.len() as u64).to_le_bytes());
+        xbch.extend_from_slice(&(fssm.len() as u64).to_le_bytes());
+        xbch.extend_from_slice(&stream);
+
+        let mut out = vec![0u8; 0x18];
+        out.extend_from_slice(b"XDAT");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&0x24u32.to_le_bytes());
+        let offset = (out.len() + 12) as u32;
+        for v in [0x0du32, offset, xbch.len() as u32] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&xbch);
+        out
+    }
+
+    fn dxil_program(container: &[u8]) -> crate::dxil::DxilProgram<'_> {
+        let c = crate::dxbc::Container::parse(container).unwrap();
+        let part = c.part(crate::dxbc::FourCC::DXIL).unwrap().data;
+        crate::dxil::DxilProgram::parse(part).unwrap()
+    }
+
+    /// Value-symbol names of an unabbreviated LLVM 3.7 module.
+    fn symbol_names(bitcode: &[u8]) -> Vec<String> {
+        let mut words = Vec::with_capacity(bitcode.len() / 4);
+        for chunk in bitcode.chunks(4) {
+            words.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        let mut bits = Bits {
+            words: &words,
+            pos: 32,
+        };
+        assert_eq!(bits.take(2), 1, "bitcode does not open with a block");
+        assert_eq!(bits.vbr(8), 8, "bitcode block is not the module");
+        let width = bits.vbr(4) as u32;
+        bits.align();
+        let len = bits.take(32) as usize;
+        let end = bits.pos + len * 32;
+        let mut names = Vec::new();
+        walk(&mut bits, width, end, false, &mut names);
+        names
+    }
+
+    struct Bits<'a> {
+        words: &'a [u32],
+        pos: usize,
+    }
+
+    impl Bits<'_> {
+        fn take(&mut self, width: u32) -> u64 {
+            let mut v = 0u64;
+            for i in 0..width {
+                let p = self.pos + i as usize;
+                let bit = u64::from((self.words[p / 32] >> (p % 32)) & 1);
+                v |= bit << i;
+            }
+            self.pos += width as usize;
+            v
+        }
+
+        fn vbr(&mut self, width: u32) -> u64 {
+            let hi = 1u64 << (width - 1);
+            let mut v = 0u64;
+            let mut shift = 0;
+            loop {
+                let c = self.take(width);
+                v |= (c & (hi - 1)) << shift;
+                if c & hi == 0 {
+                    return v;
+                }
+                shift += width - 1;
+            }
+        }
+
+        fn align(&mut self) {
+            let rem = self.pos % 32;
+            if rem != 0 {
+                self.pos += 32 - rem;
+            }
+        }
+    }
+
+    fn walk(bits: &mut Bits<'_>, width: u32, end: usize, symbols: bool, names: &mut Vec<String>) {
+        while bits.pos < end {
+            match bits.take(width) {
+                0 => {
+                    bits.align();
+                    return;
+                }
+                1 => {
+                    let id = bits.vbr(8);
+                    let inner = bits.vbr(4) as u32;
+                    bits.align();
+                    let len = bits.take(32) as usize;
+                    let body = bits.pos + len * 32;
+                    if id == 14 {
+                        walk(bits, inner, body, true, names);
+                    } else {
+                        bits.pos = body;
+                    }
+                }
+                3 => {
+                    let rec = bits.vbr(6);
+                    let n = bits.vbr(6) as usize;
+                    let ops: Vec<u64> = (0..n).map(|_| bits.vbr(6)).collect();
+                    if symbols && rec == 1 && ops.len() > 1 {
+                        names.push(ops[1..].iter().map(|c| char::from(*c as u8)).collect());
+                    }
+                }
+                other => panic!("abbreviation {other} in a module written without them"),
+            }
+        }
     }
 }
