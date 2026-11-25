@@ -77,45 +77,29 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
-            device
-                .CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?
-                .cast()
+            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
         }
     };
     if !blob.is_empty() {
         match make(&blob) {
             Ok(library) => {
                 tracing::info!(bytes = blob.len(), "host pipeline library loaded");
-                return Some(Library {
-                    library,
-                    _blob: blob,
-                    added: 0,
-                });
+                return Some(Library { library, _blob: blob, added: 0 });
             }
-            Err(e) => {
-                tracing::info!(error = %e, "host pipeline library rejected; starting an empty one")
-            }
+            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
     let library = make(&[]).ok()?;
-    Some(Library {
-        library,
-        _blob: Vec::new(),
-        added: 0,
-    })
+    Some(Library { library, _blob: Vec::new(), added: 0 })
 }
 
 /// A pipeline's name in the library: the hash of what its host
 /// description holds.
 pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
     let mut h = blake3::Hasher::new();
-    for part in [kind.as_bytes(), root]
-        .into_iter()
-        .chain(code.iter().copied())
-        .chain([state.as_bytes()])
-    {
+    for part in [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]) {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
@@ -134,10 +118,7 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
-    if let Ok(pso) = load(
-        &library.lock().unwrap_or_else(|e| e.into_inner()).library,
-        PCWSTR(wide.as_ptr()),
-    ) {
+    if let Ok(pso) = load(&library.lock().unwrap_or_else(|e| e.into_inner()).library, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
@@ -158,9 +139,7 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else {
-        return;
-    };
+    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -189,13 +168,7 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
-    let used: Vec<String> = USED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .flatten()
-        .cloned()
-        .collect();
+    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
@@ -231,11 +204,7 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let set: HashSet<String> = listed
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect();
+        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
         *used = Some(set);
     }
@@ -274,12 +243,10 @@ mod tests {
 
     #[test]
     fn a_rejected_blob_gives_an_empty_library() {
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
-        else {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
-        let library =
-            open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
+        let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());

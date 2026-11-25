@@ -155,8 +155,7 @@ impl Shadow {
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
-        let host =
-            |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (start, end) = match &*before {
             Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
