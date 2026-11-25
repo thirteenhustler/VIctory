@@ -35,6 +35,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
 }
@@ -558,6 +559,107 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.load(c, at))
     }
 
+    /// A 64-bit global atomic (`global_atomic_*_x2`) on the raw buffer the
+    /// address was traced to. 32-bit global atomics are not translated.
+    fn global_atomic(&mut self, inst: &Inst, b: usize, i: usize, rest: &str) -> Result<(), Why> {
+        let Some(rest) = rest.strip_suffix("_x2") else {
+            return Err(inst.name());
+        };
+        let op = match rest {
+            "add" | "sub" => 0,
+            "and" => 1,
+            "or" => 2,
+            "xor" => 3,
+            "smin" => 4,
+            "smax" => 5,
+            "umin" => 6,
+            "umax" => 7,
+            "swap" => 8,
+            "cmpswap" => u32::MAX,
+            _ => return Err(inst.name()),
+        };
+        let Fields::Flat {
+            dst, data, cache, ..
+        } = &inst.fields
+        else {
+            unreachable!()
+        };
+        let a = *self
+            .scalar
+            .get(&(b, i))
+            .ok_or("an untracked global address")?;
+        if a.param == CODE {
+            return Err("a global atomic of the shader's own code");
+        }
+        let guard = self.guard(b, i)?;
+        let c = self.cur;
+        let mut off = self.s.m.i32(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            off = self.s.m.bin(c, Bin::Add, off, d);
+        }
+        let src = Source::Built {
+            address: a,
+            bits: 0,
+            words: [0, 0],
+        };
+        let h = self.handle((b, i), &src, false, (11 | 0x1000, 0))?;
+        let d = data.as_ref().ok_or("global atomic data")?;
+        let vals = self.vgprs(inst, d, 2 * if op == u32::MAX { 2 } else { 1 })?;
+        let pack = |l: &mut Self, at: usize| l.pack64(vals[at], vals[at + 1]);
+        let mut value = pack(self, 0);
+        let compare = (op == u32::MAX).then(|| pack(self, 2));
+        if rest == "sub" {
+            let t = self.s.m.int(64);
+            let z = self.s.m.int_const(t, 0);
+            value = self.s.m.bin(c, Bin::Sub, z, value);
+        }
+        let returns = cache.glc;
+        let dst_reg = match dst {
+            Some(Operand::Vector { reg, .. }) if returns => Some(*reg),
+            _ => None,
+        };
+        let old = if let Some(reg) = dst_reg {
+            let lo = self.i32_of(inst.read(Reg::V(reg)).ok_or("a global atomic result")?)?;
+            let hi = self.i32_of(inst.read(Reg::V(reg + 1)).ok_or("a global atomic result")?)?;
+            self.pack64(lo, hi)
+        } else {
+            let t = self.s.m.int(64);
+            self.s.m.int_const(t, 0)
+        };
+        self.s.atomic_int64_heap = true;
+        let iu = self.s.m.undef(self.s.t.i32);
+        let at = self.begin_guarded(guard);
+        let ret = self.s.m.int(64);
+        let r = if let Some(compare) = compare {
+            self.s.op(
+                self.cur,
+                "atomicCompareExchange.i64",
+                Attr::NoUnwind,
+                ret,
+                79,
+                &[h, off, iu, iu, compare, value],
+            )
+        } else {
+            let code = self.s.m.i32(op);
+            self.s.op(
+                self.cur,
+                "atomicBinOp.i64",
+                Attr::NoUnwind,
+                ret,
+                78,
+                &[h, code, off, iu, iu, value],
+            )
+        };
+        let r = self.end_guarded(at, &[(r, old)])[0];
+        if let Some(reg) = dst_reg {
+            let (lo, hi) = self.split64(r);
+            self.write(inst, Reg::V(reg), lo, None);
+            self.write(inst, Reg::V(reg + 1), hi, None);
+        }
+        Ok(())
+    }
+
     /// A global memory load (`global_load_*`): from the program's constant
     /// table, or from a root SRV at the address the title sets.
     fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -565,6 +667,9 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if let Some(rest) = name.strip_prefix("global_atomic_") {
+            return self.global_atomic(inst, b, i, rest);
+        }
         let rest = name
             .strip_prefix("global_load_")
             .ok_or("a global memory write")?;
@@ -882,11 +987,13 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_uavs,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3261,6 +3368,9 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
+                    (RootType::Descriptor, _, p) if (p & !0x1000) == 11 && p & 0x1000 != 0 => {
+                        Ok(self.s.root_uav_handle(rp.slot))
+                    }
                     _ => Err("a root UAV or typed root view"),
                 }
             }
@@ -4048,6 +4158,18 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// Two register dwords as an i64, low dword first.
+    fn pack64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The low and high dwords of an i64.
@@ -5803,20 +5925,30 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
-        // min and max, exchange; compare-exchange apart.
-        let atomic = match name.strip_prefix("buffer_atomic_") {
-            None => None,
-            Some("add") => Some(0),
-            Some("and") => Some(1),
-            Some("or") => Some(2),
-            Some("xor") => Some(3),
-            Some("smin") => Some(4),
-            Some("smax") => Some(5),
-            Some("umin") => Some(6),
-            Some("umax") => Some(7),
-            Some("swap") => Some(8),
-            Some("cmpswap") => Some(u32::MAX),
-            Some(_) => return Err(name),
+        // min and max, exchange; compare-exchange apart. `_x2` is the
+        // 64-bit form (two data dwords, four for compare-swap).
+        let (atomic, wide) = match name.strip_prefix("buffer_atomic_") {
+            None => (None, false),
+            Some(rest) => {
+                let (rest, wide) = match rest.strip_suffix("_x2") {
+                    Some(rest) => (rest, true),
+                    None => (rest, false),
+                };
+                let op = match rest {
+                    "add" | "sub" => Some(0),
+                    "and" => Some(1),
+                    "or" => Some(2),
+                    "xor" => Some(3),
+                    "smin" => Some(4),
+                    "smax" => Some(5),
+                    "umin" => Some(6),
+                    "umax" => Some(7),
+                    "swap" => Some(8),
+                    "cmpswap" => Some(u32::MAX),
+                    _ => return Err(name),
+                };
+                (op, wide)
+            }
         };
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
@@ -5900,7 +6032,27 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
-            let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
+            let words: u8 = if wide { 2 } else { 1 };
+            let vals = self.vgprs(inst, d, words * if op == u32::MAX { 2 } else { 1 })?;
+            let pack = |l: &mut Self, at: usize| {
+                if wide {
+                    l.pack64(vals[at], vals[at + 1])
+                } else {
+                    vals[at]
+                }
+            };
+            let mut value = pack(self, 0);
+            // Compare value, in this block so the guarded atomic can use it.
+            let compare = (op == u32::MAX).then(|| pack(self, words as usize));
+            if name.contains("_sub") {
+                let z = if wide {
+                    let t = self.s.m.int(64);
+                    self.s.m.int_const(t, 0)
+                } else {
+                    self.s.m.i32(0)
+                };
+                value = self.s.m.bin(c, Bin::Sub, z, value);
+            }
             let (h, coords) = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -5916,35 +6068,59 @@ impl<'a> Lower<'a> {
                 return Err("buffer atomic data");
             };
             let returns = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if returns => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
+            let old = if returns && wide {
+                let lo = self.i32_of(inst.read(Reg::V(reg)).ok_or("buffer atomic data")?)?;
+                let hi = self.i32_of(inst.read(Reg::V(reg + 1)).ok_or("buffer atomic data")?)?;
+                self.pack64(lo, hi)
+            } else if let Some(v) = inst.read(Reg::V(reg)).filter(|_| returns) {
+                self.i32_of(v)?
+            } else if wide {
+                let t = self.s.m.int(64);
+                self.s.m.int_const(t, 0)
+            } else {
+                self.s.m.i32(0)
             };
+            if wide {
+                self.s.atomic_int64_heap = true;
+            }
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
-            let r = if op == u32::MAX {
-                // cmpswap: data is (new, compare).
+            let ret = if wide { self.s.m.int(64) } else { self.s.t.i32 };
+            let suffix = if wide { "i64" } else { "i32" };
+            let r = if let Some(compare) = compare {
+                // cmpswap: data is (new, compare), each value one or two dwords.
                 let mut args = vec![h];
                 args.extend(coords);
-                args.extend([vals[1], vals[0]]);
+                args.extend([compare, value]);
                 self.s.op(
                     self.cur,
-                    "atomicCompareExchange.i32",
+                    &format!("atomicCompareExchange.{suffix}"),
                     Attr::NoUnwind,
-                    i32t,
+                    ret,
                     79,
                     &args,
                 )
             } else {
                 let mut args = vec![h, self.s.m.i32(op)];
                 args.extend(coords);
-                args.push(vals[0]);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                args.push(value);
+                self.s.op(
+                    self.cur,
+                    &format!("atomicBinOp.{suffix}"),
+                    Attr::NoUnwind,
+                    ret,
+                    78,
+                    &args,
+                )
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
-                self.write(inst, Reg::V(reg), r, None);
+                if wide {
+                    let (lo, hi) = self.split64(r);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.write(inst, Reg::V(reg), r, None);
+                }
             }
             return Ok(());
         }
@@ -6560,7 +6736,7 @@ impl<'a> Lower<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -6649,5 +6825,266 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    /// `buffer_atomic_*_x2` and `global_atomic_*_x2` become DXIL i64 atomics.
+    /// A 32-bit buffer atomic stays i32. A 32-bit global atomic still fails.
+    #[test]
+    fn wide_buffer_and_global_atomics_are_i64() {
+        let heap = 0x1000_0000u64;
+        let int64 = 0x8000u64;
+        for (op, glc, dxop) in [
+            (0x052u32, true, "dx.op.atomicBinOp.i64"),
+            (0x053, true, "dx.op.atomicBinOp.i64"),
+            (0x051, false, "dx.op.atomicCompareExchange.i64"),
+        ] {
+            let lowered = lower_buffer(op, glc).unwrap_or_else(|e| panic!("op {op:#x}: {e}"));
+            let names = symbol_names(&dxil_bitcode(&lowered.dxil));
+            assert!(names.iter().any(|n| n == dxop), "{op:#x} emitted {names:?}");
+            assert!(
+                names
+                    .iter()
+                    .all(|n| !n.contains("atomic") || !n.ends_with("i32"))
+            );
+            let features = sfi0(&lowered.dxil);
+            assert_eq!(features & (int64 | heap), int64 | heap, "{features:#x}");
+            assert!(lowered.root_uavs.is_empty());
+        }
+        let narrow = lower_buffer(0x032, true).unwrap();
+        let names = symbol_names(&dxil_bitcode(&narrow.dxil));
+        assert!(
+            names.iter().any(|n| n == "dx.op.atomicBinOp.i32"),
+            "{names:?}"
+        );
+        assert_eq!(sfi0(&narrow.dxil) & (int64 | heap), 0);
+
+        let global = lower_global(0x052, true).unwrap_or_else(|e| panic!("{e}"));
+        let names = symbol_names(&dxil_bitcode(&global.dxil));
+        assert!(
+            names.iter().any(|n| n == "dx.op.atomicBinOp.i64"),
+            "{names:?}"
+        );
+        assert_eq!(global.root_uavs, vec![0]);
+        assert_eq!(sfi0(&global.dxil) & heap, heap);
+
+        let err = match lower_global(0x032, true) {
+            Err(e) => e,
+            Ok(_) => panic!("a 32-bit global atomic translated"),
+        };
+        assert!(err.to_string().contains("global_atomic_add"), "{err}");
+    }
+
+    fn table() -> Vec<RootParam> {
+        vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }]
+    }
+
+    fn lower_buffer(op: u32, glc: bool) -> Result<super::Lowered, crate::ShaderError> {
+        let mut w0 = (0x38u32 << 26) | ((op & 0x7F) << 18);
+        if op & 0x80 != 0 {
+            w0 |= 1 << 25;
+        }
+        if glc {
+            w0 |= 1 << 14;
+        }
+        // vaddr v4, vdata v0, resource s[4:7], no scalar offset.
+        let w1 = 4 | (1 << 16) | 0x7D00_0000;
+        let words = [
+            0xBE82_0300u32, // s_mov_b32 s2, s0
+            0xBE83_0380,    // s_mov_b32 s3, 0
+            0xF408_0101,    // s_load_dwordx4 s[4:7], s[2:3], null
+            0xFA00_0000,
+            w0,
+            w1,
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let decoded = crate::gfx10::decode(&code).unwrap();
+        assert!(
+            decoded
+                .iter()
+                .any(|i| i.name().is_some_and(|n| n.starts_with("buffer_atomic_"))),
+            "decoded {:?}",
+            decoded.iter().map(|i| i.name()).collect::<Vec<_>>()
+        );
+        lower_compute(&code, table(), 4)
+    }
+
+    fn lower_global(op: u32, glc: bool) -> Result<super::Lowered, crate::ShaderError> {
+        let mut w0 = (0x37u32 << 26) | ((op & 0x7F) << 18) | (2 << 14);
+        if glc {
+            w0 |= 1 << 16;
+        }
+        // vdst v6, saddr s[0:1], vdata v0, vaddr v4.
+        let w1 = 4 | (6 << 24);
+        let words = [0x7E08_0280u32, w0, w1, S_ENDPGM];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let decoded = crate::gfx10::decode(&code).unwrap();
+        let atomic = decoded
+            .iter()
+            .find_map(|i| i.name().filter(|n| n.starts_with("global_atomic_")));
+        assert!(
+            atomic.is_some(),
+            "decoded {:?}",
+            decoded.iter().map(|i| i.name()).collect::<Vec<_>>()
+        );
+        lower_compute(
+            &code,
+            vec![RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            4,
+        )
+    }
+
+    fn lower_compute(
+        code: &[u8],
+        layout: Vec<RootParam>,
+        rsrc2: u32,
+    ) -> Result<super::Lowered, crate::ShaderError> {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 16,
+            layout,
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2,
+                threads: [1, 1, 1],
+            }),
+            code: code.to_vec(),
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+    }
+
+    fn sfi0(container: &[u8]) -> u64 {
+        let c = crate::dxbc::Container::parse(container).unwrap();
+        let data = c.part(crate::dxbc::FourCC::SFI0).unwrap().data;
+        u64::from_le_bytes(data[..8].try_into().unwrap())
+    }
+
+    fn dxil_bitcode(container: &[u8]) -> Vec<u8> {
+        let c = crate::dxbc::Container::parse(container).unwrap();
+        let part = c.part(crate::dxbc::FourCC::DXIL).unwrap().data;
+        crate::dxil::DxilProgram::parse(part)
+            .unwrap()
+            .bitcode
+            .to_vec()
+    }
+
+    fn symbol_names(bitcode: &[u8]) -> Vec<String> {
+        let mut words = Vec::with_capacity(bitcode.len() / 4);
+        for chunk in bitcode.chunks(4) {
+            words.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        let mut bits = Bits {
+            words: &words,
+            pos: 32,
+        };
+        assert_eq!(bits.take(2), 1);
+        assert_eq!(bits.vbr(8), 8);
+        let width = bits.vbr(4) as u32;
+        bits.align();
+        let len = bits.take(32) as usize;
+        let end = bits.pos + len * 32;
+        let mut names = Vec::new();
+        walk(&mut bits, width, end, false, &mut names);
+        names
+    }
+
+    struct Bits<'a> {
+        words: &'a [u32],
+        pos: usize,
+    }
+
+    impl Bits<'_> {
+        fn take(&mut self, width: u32) -> u64 {
+            let mut v = 0u64;
+            for i in 0..width {
+                let p = self.pos + i as usize;
+                let bit = u64::from((self.words[p / 32] >> (p % 32)) & 1);
+                v |= bit << i;
+            }
+            self.pos += width as usize;
+            v
+        }
+
+        fn vbr(&mut self, width: u32) -> u64 {
+            let hi = 1u64 << (width - 1);
+            let mut v = 0;
+            let mut shift = 0;
+            loop {
+                let c = self.take(width);
+                v |= (c & (hi - 1)) << shift;
+                if c & hi == 0 {
+                    return v;
+                }
+                shift += width - 1;
+            }
+        }
+
+        fn align(&mut self) {
+            let rem = self.pos % 32;
+            if rem != 0 {
+                self.pos += 32 - rem;
+            }
+        }
+    }
+
+    fn walk(bits: &mut Bits<'_>, width: u32, end: usize, symbols: bool, names: &mut Vec<String>) {
+        while bits.pos < end {
+            match bits.take(width) {
+                0 => {
+                    bits.align();
+                    return;
+                }
+                1 => {
+                    let id = bits.vbr(8);
+                    let inner = bits.vbr(4) as u32;
+                    bits.align();
+                    let len = bits.take(32) as usize;
+                    let body = bits.pos + len * 32;
+                    if id == 14 {
+                        walk(bits, inner, body, true, names);
+                    } else {
+                        bits.pos = body;
+                    }
+                }
+                3 => {
+                    let rec = bits.vbr(6);
+                    let n = bits.vbr(6) as usize;
+                    let ops: Vec<u64> = (0..n).map(|_| bits.vbr(6)).collect();
+                    if symbols && rec == 1 && ops.len() > 1 {
+                        names.push(ops[1..].iter().map(|c| char::from(*c as u8)).collect());
+                    }
+                }
+                other => panic!("abbreviation {other}"),
+            }
+        }
     }
 }

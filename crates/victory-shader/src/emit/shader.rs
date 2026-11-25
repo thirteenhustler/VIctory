@@ -64,6 +64,11 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Root UAVs (raw buffers) written by 64-bit global atomics, likewise.
+    pub root_uavs: Vec<(u8, V)>,
+    /// A 64-bit atomic on a descriptor-heap or root raw buffer. Declared in
+    /// `SFI0`, not in the shader-flag word.
+    pub atomic_int64_heap: bool,
     pub flags: u64,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
@@ -117,6 +122,8 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            atomic_int64_heap: false,
             flags: 0,
             threads: None,
             wave_size: None,
@@ -232,6 +239,30 @@ impl Shader {
         h
     }
 
+    /// The handle of the root UAV (a raw buffer) of root parameter `slot`.
+    pub fn root_uav_handle(&mut self, slot: u8) -> V {
+        if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
+            return h;
+        }
+        let r = self.m.i32(u32::from(slot));
+        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.root_uavs.push((slot, h));
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -305,6 +336,7 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || !self.root_uavs.is_empty()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -388,6 +420,36 @@ impl Shader {
                 }
                 srvs = Some(self.m.md_node(list));
             }
+            let mut uavs = None;
+            if !self.root_uavs.is_empty() {
+                let ty = self
+                    .m
+                    .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let mut list = Vec::new();
+                for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                    let ops = vec![
+                        Some(i32c(&mut self, n as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(i32c(&mut self, 0)),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 7,
+                        space: ROOT_CBV_SPACE,
+                        register: u32::from(slot),
+                        dxil_kind: 11,
+                    });
+                }
+                uavs = Some(self.m.md_node(list));
+            }
             let mut samplers = None;
             if self.samplers > 0 {
                 let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
@@ -417,7 +479,7 @@ impl Shader {
                 }
                 samplers = Some(self.m.md_node(list));
             }
-            resources = Some(self.m.md_node(vec![srvs, None, cbvs, samplers]));
+            resources = Some(self.m.md_node(vec![srvs, uavs, cbvs, samplers]));
             // PSV0 lists them as the module does: CBVs, samplers, SRVs.
             bindings.sort_by_key(|b| match b.kind {
                 2 => 0,
@@ -563,6 +625,11 @@ impl Shader {
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= 0x400_0000;
+        }
+        if self.atomic_int64_heap {
+            // 64-bit atomics on a raw buffer reached through the descriptor
+            // heap, or on a root raw UAV.
+            features |= 0x1000_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);
